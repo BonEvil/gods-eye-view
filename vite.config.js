@@ -42,6 +42,7 @@ import {
   isOverBudget as isTomTomOverBudget,
 } from './src/data/tomtomTiles.js';
 import { filterTrailing24h, parseFirmsCsv } from './src/data/firmsCsv.js';
+import { googleApiReferrer } from './src/data/googleReferrer.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { defineConfig, loadEnv } from 'vite';
@@ -4575,7 +4576,10 @@ function cctvProxy() {
       sv.searchParams.set('key', streetViewKey);
 
       const svResp = await fetch(sv.toString(), {
-        headers: { 'User-Agent': 'gods-eye-view-cctv-proxy/1.0' },
+        headers: {
+          'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
+          Referer: googleApiReferrer(process.env),
+        },
         signal: AbortSignal.timeout(CCTV_FRAME_FETCH_TIMEOUT_MS),
       });
       const svType = svResp.headers.get('content-type') || '';
@@ -5443,6 +5447,7 @@ export function googlePlacesContextProxy() {
           headers: {
             'Content-Type': 'application/json',
             'X-Goog-Api-Key': apiKey,
+            Referer: googleApiReferrer(process.env),
             'X-Goog-FieldMask': [
               'places.id',
               'places.displayName',
@@ -5563,6 +5568,7 @@ export function googlePlacesContextProxy() {
           headers: {
             'Content-Type': 'application/json',
             'X-Goog-Api-Key': apiKey,
+            Referer: googleApiReferrer(process.env),
             'X-Goog-FieldMask': [
               'places.id',
               'places.displayName',
