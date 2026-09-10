@@ -90,6 +90,13 @@ test('doctor recognizes every OpenSky OAuth keychain alias used by dev-fresh', (
   );
 });
 
+test('doctor recognizes the Launch Library 2 Keychain item used by dev-fresh', () => {
+  assert.deepEqual(
+    credential('LL2_API_TOKEN').keychain,
+    [['launch-library-2', 'api-token']],
+  );
+});
+
 test('Pinokio-scoped diagnosis ignores Keychain items its start path does not import', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'gev-pinokio-doctor-'));
   try {

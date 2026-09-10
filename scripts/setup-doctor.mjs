@@ -29,7 +29,7 @@ export const CREDENTIALS = Object.freeze([
       ['client_secret', 'client-secret', 'secret'].map((account) => [service, account])
     )),
   },
-  { name: 'LL2_API_TOKEN', label: 'Launch Library 2', keychain: [] },
+  { name: 'LL2_API_TOKEN', label: 'Launch Library 2', keychain: [['launch-library-2', 'api-token']] },
 ]);
 
 export function isConfiguredValue(value) {

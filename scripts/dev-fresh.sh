@@ -219,6 +219,7 @@ AISSTREAM_API_KEY="${AISSTREAM_API_KEY:-$(read_keychain_secret "aisstream-api" "
 CESIUM_ION_TOKEN="${CESIUM_ION_TOKEN:-$(read_keychain_secret "cesium-ion" "token")}"
 TOMTOM_API_KEY="${TOMTOM_API_KEY:-$(read_keychain_secret "tomtom-api" "api-key")}"
 FIRMS_MAP_KEY="${FIRMS_MAP_KEY:-$(read_keychain_secret "firms-map" "map-key")}"
+LL2_API_TOKEN="${LL2_API_TOKEN:-$(read_keychain_secret "launch-library-2" "api-token")}"
 
 if [[ ! -f "src/data/cctv.js" ]]; then
   echo "error: expected CCTV layer file missing: src/data/cctv.js"

@@ -64,6 +64,14 @@ test('dev-fresh gives explicit or dotenv Google configuration precedence over Ke
   assert.ok(precedence >= 0 && keychainFallback > precedence);
 });
 
+test('dev-fresh loads Launch Library 2 from its dedicated Keychain item', async () => {
+  const source = await fs.readFile(new URL('../scripts/dev-fresh.sh', import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /LL2_API_TOKEN="\$\{LL2_API_TOKEN:-\$\(read_keychain_secret "launch-library-2" "api-token"\)\}"/,
+  );
+});
+
 test('dev-fresh passes names-only boot provenance before resolving file fallbacks', async () => {
   const source = await fs.readFile(new URL('../scripts/dev-fresh.sh', import.meta.url), 'utf8');
   const capture = source.indexOf('KEY_SETUP_EXTERNAL_KEYS=()');
