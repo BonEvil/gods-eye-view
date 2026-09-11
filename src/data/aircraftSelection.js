@@ -58,7 +58,7 @@ export function restoreAircraftView(viewer) {
   return true;
 }
 
-export function closeAircraftDetails(viewer, layerId) {
+export function closeAircraftDetails(viewer, layerId, { preserveContext = false } = {}) {
   const state = viewer && details.get(viewer);
   if (!state || (layerId && state.layerId !== layerId)) return;
   clearInterval(state.timer);
@@ -66,7 +66,7 @@ export function closeAircraftDetails(viewer, layerId) {
   state.panel.remove();
   if (hadFocus) viewer.scene.canvas?.focus?.({ preventScroll: true });
   details.delete(viewer);
-  clearSelectedEntityContextForLayer(state.layerId);
+  if (!preserveContext) clearSelectedEntityContextForLayer(state.layerId);
 }
 
 /** A details selection never moves the camera. Only the explicit Track action follows. */
@@ -109,7 +109,11 @@ export function showAircraftDetails(viewer, { id, layerId, read, track, stop, is
   };
   trackButton.addEventListener('click', () => {
     if (isTracking(id)) { (activeStops.get(viewer) || stop)(); closeAircraftDetails(viewer); }
-    else { track(id); render(); }
+    else {
+      track(id);
+      if (isTracking(id)) closeAircraftDetails(viewer, layerId, { preserveContext: true });
+      else render();
+    }
   });
   closeButton.addEventListener('click', () => { (activeStops.get(viewer) || stop)(); closeAircraftDetails(viewer); });
   document.body.append(panel);
