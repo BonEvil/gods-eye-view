@@ -1,3 +1,6 @@
+import { createFeedRegionLeases } from './src/data/feedRegionLeases.js';
+import { createSharedFrameCache } from './src/data/sharedFrameCache.js';
+import { parseFeedRegion, selectFeedRows } from './src/data/feedRegion.js';
 /**
  * Vite configuration for God's Eye View — a cinematic geospatial app.
  *
@@ -122,16 +125,6 @@ let _openskyToken = null;
 let _openskyTokenExpiry = 0;
 /** @type {Promise<string|null>|null} In-flight token refresh promise (coalesces concurrent callers). */
 let _openskyTokenPromise = null;
-/** @type {string|null} Cached upstream response body (JSON text). */
-let _openskyCacheBody = null;
-/** @type {number} HTTP status of the cached response. */
-let _openskyCacheStatus = 0;
-/** @type {number} Epoch-ms when the response was cached. */
-let _openskyCacheTime = 0;
-/** @type {{requestedMode:string,usedMode:string,reason:string}|null} Auth metadata for the cached response. */
-let _openskyCacheMeta = null;
-/** @type {number|null} Source snapshot epoch from the cached OpenSky body. */
-let _openskyCacheSourceEpochMs = null;
 /** TTL for the OpenSky response cache (ms). */
 const OPENSKY_CACHE_MS = 9000;
 // --- OpenSky credit governor (field-test fix 2026-07-06) -------------------
@@ -143,7 +136,7 @@ const OPENSKY_CACHE_MS = 9000;
 //     budget thins, the proxy stretches its cache TTL so a full day of
 //     continuous use never exhausts it.
 //  2. 429 cooldown: honor X-Rate-Limit-Retry-After-Seconds — no upstream
-//     attempts until it passes (bounded 30 s … 30 min).
+//     attempts until it passes (at least 30 seconds).
 //  3. Serve-stale: while rate-limited/cooling, serve the last-good body (200 +
 //     X-OpenSky-Stale) so the layer keeps rendering instead of dying.
 /** @type {number} Current adaptive TTL (ms) — starts at the base cache TTL. */
@@ -3011,21 +3004,82 @@ function openSkySourceIsStale(sourceEpochMs, now = Date.now()) {
  *
  * @returns {import('vite').Plugin}
  */
-function openSkyProxy() {
+export function installFeedResponseFilter(req, res, field) {
+  const params = new URL(req.url || '', 'http://localhost').searchParams;
+  let region;
+  try { region = parseFeedRegion(params); }
+  catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid feed bbox' }));
+    return null;
+  }
+  const keep = params.get('keep') || '';
+  const end = res.end.bind(res);
+  res.end = (body, ...args) => {
+    if (region && typeof body === 'string') {
+      try {
+        const payload = JSON.parse(body);
+        if (Array.isArray(payload[field])) {
+          payload[field] = selectFeedRows(payload[field], region, keep, Infinity,
+            row => field === 'states' ? { lon: row[5], lat: row[6] } : row,
+            row => field === 'states' ? row[0] : row.hex);
+          body = JSON.stringify(payload);
+        }
+      } catch { /* preserve provider errors */ }
+    }
+    return end(body, ...args);
+  };
+  const writeHead = res.writeHead.bind(res);
+  res.writeHead = (status, headers = {}) => writeHead(status, {
+    ...headers,
+    ...(region ? { 'X-Flight-Coverage': `${headers['X-Flight-Coverage'] || 'provider snapshot'}; buffered view region`, 'X-Feed-Bounds': region.join(',') } : {}),
+  });
+  return { region, keep };
+}
+
+export function openSkyProxy() {
+  const regions = new Map();
+  let pending = Promise.resolve();
+  let nextRequestAt = 0;
   return {
     name: 'opensky-proxy',
     configureServer(server) {
       server.middlewares.use('/api/opensky', async (req, res) => {
+        const selection = installFeedResponseFilter(req, res, 'states');
+        if (!selection) return;
+        // Serialize misses across clients so each observes the updated quota/cache.
+        let release;
+        const previous = pending;
+        pending = new Promise(resolve => { release = resolve; });
+        await previous;
+        const key = JSON.stringify([selection.region, normalizeOpenSkyAuthMode(process.env.OPENSKY_AUTH_MODE)]);
+        let cache = regions.get(key);
+        if (!cache) {
+          cache = {};
+          regions.set(key, cache);
+          while (regions.size > 32) regions.delete(regions.keys().next().value);
+        }
+        const upstreamUrl = new URL('https://opensky-network.org/api/states/all?extended=1');
+        if (selection.region) {
+          const [west, south, east, north] = selection.region;
+          upstreamUrl.searchParams.set('lamin', south);
+          upstreamUrl.searchParams.set('lamax', north);
+          // One latitude-bounded query at the dateline avoids doubling credit spend.
+          if (west < east) {
+            upstreamUrl.searchParams.set('lomin', west);
+            upstreamUrl.searchParams.set('lomax', east);
+          }
+        }
         try {
           const requestedMode = normalizeOpenSkyAuthMode(process.env.OPENSKY_AUTH_MODE);
           const now = Date.now();
-          const inCooldown = now < _openskyCooldownUntil;
+          const inCooldown = now < Math.max(_openskyCooldownUntil, nextRequestAt);
           // Fresh-enough cache (adaptive TTL) OR any cache during a 429
           // cooldown: serve it without touching upstream. Stale-during-cooldown
           // is deliberate (credit governor): last-good planes beat a dead layer.
-          if (_openskyCacheBody && (now - _openskyCacheTime < _openskyTtlMs || inCooldown)) {
+          if (cache.body && (now - cache.at < _openskyTtlMs || inCooldown)) {
             if (
-              openSkySourceIsStale(_openskyCacheSourceEpochMs, now)
+              openSkySourceIsStale(cache.sourceEpochMs, now)
               && await serveAdsbLolPointFallback(
                 req,
                 res,
@@ -3035,37 +3089,37 @@ function openSkyProxy() {
             ) {
               return;
             }
-            const cachedMeta = _openskyCacheMeta || {
+            const cachedMeta = cache.meta || {
               requestedMode,
               usedMode: 'unknown',
               reason: 'cached',
             };
-            const isStale = now - _openskyCacheTime >= _openskyTtlMs;
+            const isStale = now - cache.at >= _openskyTtlMs;
             res.writeHead(
-              _openskyCacheStatus || 200,
+              cache.status || 200,
               buildOpenSkyHeaders({
                 cacheStatus: isStale ? 'STALE' : 'HIT',
                 requestedMode: cachedMeta.requestedMode || requestedMode,
                 usedMode: cachedMeta.usedMode || 'unknown',
                 reason: isStale ? 'rate_limited_serving_stale' : (cachedMeta.reason || 'cached'),
-                staleSeconds: isStale ? (now - _openskyCacheTime) / 1000 : undefined,
-                retryAfterSeconds: inCooldown ? (_openskyCooldownUntil - now) / 1000 : undefined,
+                staleSeconds: isStale ? (now - cache.at) / 1000 : undefined,
+                retryAfterSeconds: inCooldown ? (Math.max(_openskyCooldownUntil, nextRequestAt) - now) / 1000 : undefined,
               })
             );
-            res.end(_openskyCacheBody);
+            res.end(cache.body);
             return;
           }
           // Cooling down with nothing cached (cold start into a rate limit):
           // synthesize the 429 locally — hammering upstream mid-cooldown can't
           // succeed and just burns goodwill.
           if (inCooldown) {
-            if (await serveAdsbLolPointFallback(req, res, requestedMode, 'opensky_cooldown_regional_fallback')) return;
+
             res.writeHead(429, buildOpenSkyHeaders({
               cacheStatus: 'COOLDOWN',
               requestedMode,
               usedMode: 'none',
               reason: 'rate_limited',
-              retryAfterSeconds: (_openskyCooldownUntil - now) / 1000,
+              retryAfterSeconds: (Math.max(_openskyCooldownUntil, nextRequestAt) - now) / 1000,
             }));
             res.end(JSON.stringify({ error: 'OpenSky rate limited; proxy cooling down.' }));
             return;
@@ -3110,7 +3164,8 @@ function openSkyProxy() {
             }
           }
 
-          let upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers });
+          nextRequestAt = now + _openskyTtlMs;
+          let upstream = await fetch(upstreamUrl.toString(), { headers, signal: AbortSignal.timeout(12000) });
           // Auto-mode fallback: if OAuth was rejected, retry with Basic credentials
           if (
             (upstream.status === 401 || upstream.status === 403) &&
@@ -3122,7 +3177,7 @@ function openSkyProxy() {
               Accept: 'application/json',
               Authorization: `Basic ${Buffer.from(`${basicUser}:${basicPass}`).toString('base64')}`,
             };
-            upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers: retryHeaders });
+            upstream = await fetch(upstreamUrl.toString(), { headers: retryHeaders, signal: AbortSignal.timeout(12000) });
             usedMode = 'basic';
             reason = 'oauth_rejected_fallback_basic';
           }
@@ -3141,40 +3196,38 @@ function openSkyProxy() {
           ) {
             // Keep the last global snapshot available as a fail-soft cache,
             // but do not label or render it as a fresh live result.
-            _openskyCacheBody = body;
-            _openskyCacheStatus = upstream.status;
-            _openskyCacheTime = now;
-            _openskyCacheSourceEpochMs = sourceEpochMs;
-            _openskyCacheMeta = { requestedMode, usedMode, reason };
+            cache.body = body;
+            cache.status = upstream.status;
+            cache.at = now;
+            cache.sourceEpochMs = sourceEpochMs;
+            cache.meta = { requestedMode, usedMode, reason };
             return;
           }
           if (upstream.status === 429) {
             reason = 'rate_limited';
-            // Credit governor: honor OpenSky's retry-after (bounded 30 s … 30 min;
+            // Credit governor: honor OpenSky's full retry-after (at least 30 s;
             // 2 min when the header is absent) — no upstream attempts until then.
-            const retryAfterSec = Number(upstream.headers.get('x-rate-limit-retry-after-seconds'));
-            const cooldownMs = Math.min(
-              Math.max(Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : 120_000, 30_000),
-              30 * 60_000
-            );
+            const retryAfterHeader = upstream.headers.get('x-rate-limit-retry-after-seconds');
+            const retryAfterSec = retryAfterHeader === null ? NaN : Number(retryAfterHeader);
+            const cooldownMs = Math.max(Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : 120_000, 30_000);
             _openskyCooldownUntil = now + cooldownMs;
             // Serve the last-good body instead of the 429 when we have one —
             // the layer keeps rendering (STALE-cued) instead of dying.
-            if (_openskyCacheBody && _openskyCacheStatus === 200) {
+            if (cache.body && cache.status === 200) {
               res.writeHead(200, buildOpenSkyHeaders({
                 cacheStatus: 'STALE',
                 requestedMode,
                 usedMode,
                 reason: 'rate_limited_serving_stale',
-                staleSeconds: (now - _openskyCacheTime) / 1000,
+                staleSeconds: (now - cache.at) / 1000,
                 retryAfterSeconds: cooldownMs / 1000,
               }));
-              res.end(_openskyCacheBody);
+              res.end(cache.body);
               return;
             }
           }
 
-          if (!upstream.ok && !_openskyCacheBody) {
+          if (!upstream.ok && !cache.body) {
             const servedFallback = await serveAdsbLolPointFallback(
               req,
               res,
@@ -3230,11 +3283,11 @@ function openSkyProxy() {
           // Only cache successful responses — error responses (401/403/429/5xx)
           // should not be served from cache on subsequent requests
           if (upstream.ok) {
-            _openskyCacheBody = body;
-            _openskyCacheStatus = upstream.status;
-            _openskyCacheTime = now;
-            _openskyCacheSourceEpochMs = sourceEpochMs;
-            _openskyCacheMeta = {
+            cache.body = body;
+            cache.status = upstream.status;
+            cache.at = now;
+            cache.sourceEpochMs = sourceEpochMs;
+            cache.meta = {
               requestedMode,
               usedMode,
               reason,
@@ -3244,6 +3297,7 @@ function openSkyProxy() {
             // exhausting the quota mid-day. Success also clears any cooldown.
             const remaining = Number(upstream.headers.get('x-rate-limit-remaining'));
             _openskyTtlMs = openskyAdaptiveTtlMs(remaining);
+            nextRequestAt = now + _openskyTtlMs;
             _openskyCooldownUntil = 0;
           }
 
@@ -3259,14 +3313,14 @@ function openSkyProxy() {
           res.end(body);
         } catch (e) {
           console.error('[OpenSky Proxy]', e.message);
-          if (_openskyCacheBody) {
-            const cachedMeta = _openskyCacheMeta || {
+          if (cache.body) {
+            const cachedMeta = cache.meta || {
               requestedMode: normalizeOpenSkyAuthMode(process.env.OPENSKY_AUTH_MODE),
               usedMode: 'unknown',
               reason: 'cached_stale',
             };
             res.writeHead(
-              _openskyCacheStatus || 200,
+              cache.status || 200,
               buildOpenSkyHeaders({
                 cacheStatus: 'STALE',
                 requestedMode: cachedMeta.requestedMode || OPENSKY_AUTH_MODE_DEFAULT,
@@ -3274,7 +3328,7 @@ function openSkyProxy() {
                 reason: cachedMeta.reason || 'cached_stale',
               })
             );
-            res.end(_openskyCacheBody);
+            res.end(cache.body);
             return;
           }
           const requestedMode = normalizeOpenSkyAuthMode(process.env.OPENSKY_AUTH_MODE);
@@ -3289,7 +3343,7 @@ function openSkyProxy() {
             })
           );
           res.end(JSON.stringify({ error: 'OpenSky proxy error' }));
-        }
+        } finally { release(); }
       });
     },
   };
@@ -4475,6 +4529,28 @@ async function proxyMediaResponse(res, upstream, { sourceHeader = 'upstream' } =
  * @param {number} [options.timeoutMs=CCTV_FRAME_FETCH_TIMEOUT_MS] - Abort timeout.
  * @returns {Promise<{ok:true,body:Buffer,contentType:string}|null>}
  */
+async function readCctvFrameBytes(response) {
+  const cap = 8 * 1024 * 1024;
+  if (Number(response.headers.get('content-length')) > cap) throw new Error('Frame too large');
+  if (!response.body?.getReader) {
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > cap) throw new Error('Frame too large');
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks = []; let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > cap) { await reader.cancel(); throw new Error('Frame too large'); }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, size);
+  } finally { reader.releaseLock(); }
+}
+
 export async function fetchCctvImageFromUpstream(url, {
   fetchImpl = fetch,
   timeoutMs = CCTV_FRAME_FETCH_TIMEOUT_MS,
@@ -4493,7 +4569,7 @@ export async function fetchCctvImageFromUpstream(url, {
     if (!upstream.ok || !contentType.startsWith('image/')) return null;
     return {
       ok: true,
-      body: Buffer.from(await upstream.arrayBuffer()),
+      body: await readCctvFrameBytes(upstream),
       contentType,
     };
   } catch {
@@ -4517,6 +4593,10 @@ export async function fetchCctvImageFromUpstream(url, {
  * @returns {import('vite').Plugin}
  */
 function cctvProxy() {
+  const frames = createSharedFrameCache({ load: fetchCctvImageFromUpstream });
+  const fallbackFrames = createSharedFrameCache({ load: url => fetchCctvImageFromUpstream(url, {
+    fetchImpl: (input, options) => fetch(input, { ...options, headers: { ...options.headers, Referer: googleApiReferrer(process.env) } }),
+  }) });
   /** @type {Map<string,{id:string,status:string,sourceKind:string,label:string,message:string,updatedAt:number}>} */
   const health = new Map();
   /** Cap on health map entries to prevent unbounded growth. Sized to cover the
@@ -4575,21 +4655,7 @@ function cctvProxy() {
       sv.searchParams.set('return_error_code', 'true');
       sv.searchParams.set('key', streetViewKey);
 
-      const svResp = await fetch(sv.toString(), {
-        headers: {
-          'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
-          Referer: googleApiReferrer(process.env),
-        },
-        signal: AbortSignal.timeout(CCTV_FRAME_FETCH_TIMEOUT_MS),
-      });
-      const svType = svResp.headers.get('content-type') || '';
-      if (!svResp.ok || !svType.startsWith('image/')) return null;
-
-      return {
-        ok: true,
-        body: Buffer.from(await svResp.arrayBuffer()),
-        contentType: svType,
-      };
+      return await fallbackFrames.get(sv.toString());
     } catch {
       return null;
     }
@@ -4740,18 +4806,19 @@ function cctvProxy() {
             source?.snapshotUrl
             || (!isVideoFeedType(normalizeFeedType(source?.feedType)) ? source?.url : '');
 
-          const upstreamImage = await fetchCctvImageFromUpstream(upstreamCandidate);
+          const upstreamImage = await frames.get(upstreamCandidate);
           if (upstreamImage?.ok) {
             setHealth(cameraId, {
-              status: 'ok',
+              status: upstreamImage.stale ? 'degraded' : 'ok',
               sourceKind: 'snapshot',
               label: source?.provider || 'Configured source',
-              message: 'Upstream snapshot active',
+              message: upstreamImage.stale ? 'Last good snapshot; refresh unavailable' : 'Upstream snapshot active',
             });
             res.writeHead(200, {
               'Content-Type': upstreamImage.contentType,
               'Cache-Control': 'no-store',
               'X-CCTV-Source': 'upstream-image',
+              'X-CCTV-Stale': upstreamImage.stale ? '1' : '0',
             });
             res.end(upstreamImage.body);
             return;
@@ -4812,7 +4879,7 @@ function cctvProxy() {
  *
  * @returns {import('vite').Plugin}
  */
-function adsbLolProxy() {
+export function adsbLolProxy() {
   /** @type {string|null} Cached upstream JSON body. */
   let _cache = null;
   /** @type {number} Epoch-ms when the cache was populated. */
@@ -4823,6 +4890,7 @@ function adsbLolProxy() {
     name: 'adsblol-proxy',
     configureServer(server) {
       server.middlewares.use('/api/adsblol/mil', async (req, res) => {
+        if (!installFeedResponseFilter(req, res, 'ac')) return;
         try {
           const now = Date.now();
           if (_cache && now - _cacheAt < CACHE_MS) {
@@ -4862,11 +4930,12 @@ function adsbLolProxy() {
  * the Vite server keeps one backend websocket open and exposes a same-origin
  * JSON snapshot to the Cesium layer.
  */
+const aisRegions = createFeedRegionLeases();
+
 function aisLiveProxy() {
   function install(middlewares) {
     middlewares.use('/api/ais-live', async (req, res) => {
       try {
-        ensureAisStreamConnection();
         const incoming = new URL(req.url || '', 'http://localhost');
 
         // Track sub-route MUST be handled before the rows snapshot — this
@@ -4891,7 +4960,13 @@ function aisLiveProxy() {
         }
 
         const maxRows = clampInt(incoming.searchParams.get('maxRows'), 1, AISSTREAM_CACHE_MAX, AISSTREAM_CACHE_MAX);
-        const rows = aisStreamRows(maxRows);
+        const region = parseFeedRegion(incoming.searchParams);
+        const keep = incoming.searchParams.get('keep') || '';
+        const client = (incoming.searchParams.get('client') || 'legacy').slice(0, 100);
+        aisRegions.touch(client, region);
+        ensureAisStreamConnection();
+        _aisAdapter?.refreshSubscription();
+        const rows = aisStreamRows(maxRows, region, keep);
 
         const feed = aisStreamStatusSnapshot();
 
@@ -4900,6 +4975,7 @@ function aisLiveProxy() {
         res.setHeader('Cache-Control', 'no-store');
         res.end(JSON.stringify({
           rows,
+          bounds: region,
           source: 'AISStream',
           status: feed.status,
           error: feed.error,
@@ -6365,7 +6441,7 @@ function aisAdapter() {
     createSocket: (url) => {
       const WebSocketCtor = aisWebSocketImpl();
       if (!WebSocketCtor) throw new Error('ws transport unavailable');
-      return new WebSocketCtor(url);
+      return new WebSocketCtor(url, { perMessageDeflate: true });
     },
     resolveUrl: () => aisWatchdogPolicy().url,
     buildSubscription: aisStreamSubscription,
@@ -6403,6 +6479,10 @@ function aisKeyFingerprint() {
  * background interval, so recovery does not depend on browser traffic.
  */
 function ensureAisStreamConnection() {
+  if (!process.env.AISSTREAM_BOUNDING_BOXES && !aisRegions.boxes().length) {
+    if (_aisAdapter?.debug().liveSockets) _aisAdapter.dispose();
+    return;
+  }
   const adapter = aisAdapter();
   if (_aisNeedsRearm) {
     // Post-dispose re-arm, now that the restarted server's .env is loaded. The
@@ -6443,6 +6523,7 @@ function startAisStreamWatchdogTick() {
   _aisStreamTickTimer = setInterval(() => {
     try {
       ensureAisStreamConnection();
+      if (aisRegions.boxes().length) _aisAdapter?.refreshSubscription();
     } catch (error) {
       console.warn('[AISStream] watchdog tick failed', error?.message || '');
     }
@@ -6478,7 +6559,7 @@ function disposeAisStream() {
 function aisStreamSubscription() {
   return {
     APIKey: process.env.AISSTREAM_API_KEY,
-    BoundingBoxes: parseJsonEnv('AISSTREAM_BOUNDING_BOXES', AISSTREAM_DEFAULT_BBOXES),
+    BoundingBoxes: parseJsonEnv('AISSTREAM_BOUNDING_BOXES', aisRegions.boxes().length ? aisRegions.boxes() : AISSTREAM_DEFAULT_BBOXES),
     FilterMessageTypes: parseCsvOrJsonEnv('AISSTREAM_MESSAGE_TYPES', AISSTREAM_DEFAULT_MESSAGE_TYPES),
   };
 }
@@ -6653,14 +6734,14 @@ function vesselTypeFromAis(message, staticData = {}) {
   );
 }
 
-function aisStreamRows(maxRows) {
+function aisStreamRows(maxRows, region = null, keep = '') {
   const cutoff = Date.now() - AISSTREAM_STALE_MS;
   const rows = [];
   for (const row of _aisStreamVessels.values()) {
     if (row._updatedAt >= cutoff) rows.push(row);
   }
   rows.sort((a, b) => b._updatedAt - a._updatedAt);
-  return rows.slice(0, maxRows).map(({ _updatedAt, ...row }) => row);
+  return selectFeedRows(rows, region, keep, maxRows, row => row, row => row.mmsi).map(({ _updatedAt, ...row }) => row);
 }
 
 function pruneAisStreamCache() {

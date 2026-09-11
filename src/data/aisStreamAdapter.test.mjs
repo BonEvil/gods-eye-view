@@ -18,6 +18,28 @@ import {
 
 const ENV = { hasKey: true, hasTransport: true, keyFingerprint: 'key-a' };
 
+test('replacement subscriptions use the existing socket, coalesce, and respect provider spacing', () => {
+  const time = fakeClock();
+  const transport = makeMockTransport();
+  let boxes = [[[0, 0], [1, 1]]];
+  const adapter = createAisStreamAdapter({
+    createSocket: url => new transport.MockSocket(url), resolveUrl: () => 'ws://mock.invalid',
+    buildSubscription: () => ({ APIKey: 'test', BoundingBoxes: boxes }), ingestEnvelope: () => true, clock: time.clock,
+  });
+  adapter.ensure(ENV);
+  const socket = transport.created[0]; socket.readyState = 1; socket.emit('open');
+  boxes = [[[2, 2], [3, 3]]];
+  assert.equal(adapter.refreshSubscription(), false);
+  time.advance(1100);
+  assert.equal(adapter.refreshSubscription(), true);
+  assert.equal(adapter.refreshSubscription(), false);
+  assert.equal(transport.created.length, 1);
+  assert.equal(socket.sent.length, 2);
+  assert.deepEqual(JSON.parse(socket.sent[1]).BoundingBoxes, boxes);
+  adapter.dispose(); time.advance(1100); boxes = [[[5, 5], [6, 6]]];
+  assert.equal(adapter.refreshSubscription(), false);
+});
+
 const BUDGETS = Object.freeze({
   staleMs: 1_000,
   recycleAfterMs: 2_500,

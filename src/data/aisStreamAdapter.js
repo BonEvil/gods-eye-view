@@ -277,6 +277,8 @@ export function createAisStreamAdapter(options) {
   /** Never reset, including across dispose(). See rule 1 at the top. */
   let generationHighWater = 0;
   let watchdog = null;
+  let subscriptionSignature = null;
+  let subscriptionSentAt = -Infinity;
 
   /** (Re)build the state machine, preserving the generation namespace. */
   function setWatchdogOptions(watchdogOptions = {}) {
@@ -384,7 +386,10 @@ export function createAisStreamAdapter(options) {
         return; // orphan — hung up, never subscribed
       }
       try {
-        socket.send(JSON.stringify(buildSubscription()));
+        const payload = JSON.stringify(buildSubscription());
+        socket.send(payload);
+        subscriptionSignature = payload;
+        subscriptionSentAt = clock.mono();
       } catch (error) {
         failGeneration(owner, generation, classifyAisFailure({ message: error?.message }));
       }
@@ -514,7 +519,23 @@ export function createAisStreamAdapter(options) {
     sockets.clear();
   }
 
+  function refreshSubscription() {
+    const payload = JSON.stringify(buildSubscription());
+    if (payload === subscriptionSignature || clock.mono() - subscriptionSentAt < 1100) return false;
+    for (const [generation, socket] of sockets) {
+      if (!ownsSocket(generation, socket) || socket.readyState !== 1) continue;
+      try {
+        socket.send(payload);
+        subscriptionSignature = payload;
+        subscriptionSentAt = clock.mono();
+        return true;
+      } catch { return false; }
+    }
+    return false;
+  }
+
   return {
+    refreshSubscription,
     setWatchdogOptions,
     ensure,
     dispose,
