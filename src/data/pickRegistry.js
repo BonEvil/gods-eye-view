@@ -82,3 +82,8 @@ export function isOwnedByOtherLayer(layerId, pickedId) {
   }
   return false;
 }
+
+/** Query one owner without changing sibling arbitration. */
+export function isPickOwnedByLayer(layerId, pickedId) {
+  return Boolean(pickedId && _owners.get(layerId)?.(pickedId));
+}

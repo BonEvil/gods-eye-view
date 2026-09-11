@@ -1,3 +1,4 @@
+import { pickAircraft, showAircraftDetails, closeAircraftDetails, rememberAircraftView, restoreAircraftView, forgetAircraftView } from './aircraftSelection.js';
 import { parseFeedRegion, inFeedRegion } from './feedRegion.js';
 import { regionalFeedUrl, installRegionalRefresh } from './viewFeedRegion.js';
 /**
@@ -11,15 +12,14 @@ import { regionalFeedUrl, installRegionalRefresh } from './viewFeedRegion.js';
  * so that the rotation value (derived from true_track heading) operates in
  * the local tangent plane (0 deg = north, 90 deg = east).
  *
- * Click-to-track: clicking a billboard creates a tracked Entity whose
+ * Click-to-inspect: clicking a billboard opens details; Track creates an Entity whose
  * position is driven by a dead-reckoning CallbackProperty.  Between API
  * refreshes (every ~10-30 s) the aircraft advances smoothly using ENU frame
  * math.  When a new API fix arrives, a 1-second lerp blends the current
  * dead-reckoned position into the corrected fix to avoid visual snapping.
  *
  * Press Escape or click empty space to deselect a tracked flight — the camera
- * is released IN PLACE (no flyTo), so the user keeps the context they were
- * looking at (owner decision 2026-07-02).
+ * returns to the exact position and orientation saved before tracking.
  */
 import * as Cesium from 'cesium';
 import { aircraftIncludedInNearby } from './aircraftNearbyPolicy.js';
@@ -3132,15 +3132,9 @@ function _destroyTrail() {
 }
 
 /**
- * Stop tracking the currently followed aircraft.
- *
- * Restores the hidden billboard, removes the tracked Entity, resets lerp
- * state, and RELEASES the camera IN PLACE — no flyTo. Deselect used to fly
- * an ~80 km pulled-back overview; the owner field-ruled that wrong
- * (2026-07-02: "it randomly zooms way up and loses my context"). The camera
- * now simply stays at its current position/orientation, immediately free to
- * orbit/zoom. Applies to every deselect path: click-empty-space, Escape,
- * aged-out plane, layer disable, and voice stopTracking.
+ * Release the aircraft and restore the camera pose saved before following.
+ * Switching targets and cross-layer handoffs keep the original return view;
+ * an explicit stop, Escape, empty click, or layer teardown restores it.
  *
  * @param {boolean} [skipViewerUntrack=false] - ANOTHER layer just grabbed the
  *   follow-camera: tear down our own state but leave viewer.trackedEntity
@@ -3154,9 +3148,11 @@ function _destroyTrail() {
 function _clearTracking(skipViewerUntrack = false, {
   evicted = false,
   origin = 'programmatic',
+  restoreView = true,
 } = {}) {
   _trackedCameraFrameStop?.();
   _trackedCameraFrameStop = null;
+  if (restoreView && !skipViewerUntrack) closeAircraftDetails(_viewer, 'flights');
   if (!_trackedIcao) {
     clearFocusTarget('flights');
     return;
@@ -3209,6 +3205,7 @@ function _clearTracking(skipViewerUntrack = false, {
   // cannot read the previous aircraft's cached/smoothed position.
   _resetTrackedDisplay();
   _clearTrail();
+  if (restoreView && !skipViewerUntrack) restoreAircraftView(_viewer);
 }
 
 function _normalizeTrackedIcao(candidate) {
@@ -3532,11 +3529,12 @@ function _routeIsPlausible(icao24, route) {
  * @param {string} icao24 - ICAO 24-bit transponder address to track.
  */
 function _trackFlight(icao24, { origin = 'programmatic' } = {}) {
-  _clearTracking(false, { origin }); // switching planes — the new follow-camera takes over
-
   const bb = _billboards.get(icao24);
   const info = _flightData.get(icao24);
   if (!bb || !info) return;
+
+  rememberAircraftView(_viewer, () => _clearTracking(false, { origin: 'user' }));
+  _clearTracking(false, { origin, restoreView: false }); // preserve the initial view across switches
 
   _trackedIcao = icao24;
   _resetTrackedSelectionState(); // fresh selection: enter at the ENTER ceiling, full load-retry budget
@@ -5248,10 +5246,23 @@ const flightsLayer = {
  * @param {KeyboardEvent} e
  */
 function _onKeyDown(e) {
-  if (e.key === 'Escape' && _trackedIcao) {
+  if (e.key === 'Escape' && !document.body.classList.contains('cockpit-mode')) {
+    closeAircraftDetails(_viewer, 'flights');
     _cancelPendingTrackingRestore();
     _clearTracking(false, { origin: 'user' });
   }
+}
+
+function _inspectFlight(id) {
+  showAircraftDetails(_viewer, {
+    id, layerId: 'flights', read: _contextSubjectMetadata,
+    track: (target) => flightsLayer.trackById(target, { origin: 'user' }),
+    stop: () => {
+      _cancelPendingTrackingRestore();
+      _clearTracking(false, { origin: 'user' });
+    },
+    isTracking: (target) => _trackedIcao === target,
+  });
 }
 
 /**
@@ -5278,6 +5289,10 @@ function _installClickHandler(viewer) {
         _clearTracking(true, {
           origin: _viewer.trackedEntity?.gevSelectionOrigin || 'programmatic',
         });
+        if (!/^(flights|military):/.test(_viewer.trackedEntity?.gevTrackedId || '')) {
+          forgetAircraftView(_viewer);
+          closeAircraftDetails(_viewer);
+        }
       }
     });
   }
@@ -5293,32 +5308,33 @@ function _installClickHandler(viewer) {
     // first-person reference. A globe click must not fall through to the
     // normal empty-space deselection path; cockpit has explicit exit controls.
     if (document.body.classList.contains('cockpit-mode')) return;
-    const picked = viewer.scene.pick(click.position);
+    const picked = pickAircraft(viewer.scene, click.position);
 
     if (picked) {
-      // Clicking the tracked entity itself — ignore (don't deselect)
-      if (picked.id === _trackedEntity) return;
+      // Clicking the tracked entity opens its details without changing the camera
+      if (_trackedEntity && picked.id === _trackedEntity) { _inspectFlight(_trackedIcao); return; }
 
       // Clicking the plane we're ALREADY tracking (its standalone 3D model or
-      // any pick carrying its icao) — same no-op as the 2D tracked-entity click
+      // any pick carrying its icao) — inspect without changing the follow camera, as above.
+      // The former model-picking guard also protects the 2D tracked-entity click
       // above. H1: the model used to have no pick id, so this fell through to
       // "empty space" and deselected the very plane being tracked.
       if (_trackedIcao) {
         const rawPick = typeof picked.id === 'string' ? picked.id : picked.primitive?.id;
-        if (picked.primitive === _trackedModel || rawPick === _trackedIcao) return;
+        if (picked.primitive === _trackedModel || rawPick === _trackedIcao) { _inspectFlight(_trackedIcao); return; }
       }
 
       // For BillboardCollection picks, the billboard may be at picked.primitive or picked.id
       const billboard = picked.primitive;
       if (billboard && billboard.id && _billboards.has(billboard.id)) {
         _cancelPendingTrackingRestore();
-        _trackFlight(billboard.id, { origin: 'user' });
+        _inspectFlight(billboard.id);
         return;
       }
       // Some CesiumJS versions surface the id as a string on picked.id instead
       if (picked.id && typeof picked.id === 'string' && _billboards.has(picked.id)) {
         _cancelPendingTrackingRestore();
-        _trackFlight(picked.id, { origin: 'user' });
+        _inspectFlight(picked.id);
         return;
       }
     }
@@ -5336,6 +5352,7 @@ function _installClickHandler(viewer) {
     // Clicked empty space — deselect only for a clean, short click. A slow
     // stationary press may select above, but cannot release existing tracking.
     if (!isTrackingClickGesture(gesture)) return;
+    closeAircraftDetails(viewer, 'flights');
     if (_trackedIcao) {
       _cancelPendingTrackingRestore();
       _clearTracking(false, { origin: 'user' });
