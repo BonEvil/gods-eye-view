@@ -1,3 +1,5 @@
+import { inFeedRegion } from './feedRegion.js';
+import { regionalFeedUrl, installRegionalRefresh } from './viewFeedRegion.js';
 import * as Cesium from 'cesium';
 import {
   registerEntityContext,
@@ -53,6 +55,7 @@ let _lastCamPoseSig = '';
 const _scratchFocusScreen = new Cesium.Cartesian2();
 
 const DEFAULT_API_URL = '/api/ais-live';
+const regionClientId = globalThis.crypto?.randomUUID?.() || `ais-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const DEFAULT_RENDER_ROWS = 12000;
 const DEFAULT_ACTIVE_LABELS = 900;
 const REFRESH_MS = 60000;
@@ -353,6 +356,7 @@ const aisLiveVesselsLayer = {
   },
 
   enable(viewer) {
+    regionalRefresh.start(viewer);
     const wasEnabled = state.enabled;
     state.enabled = true;
     if (!wasEnabled) beginAisSession();
@@ -382,6 +386,7 @@ const aisLiveVesselsLayer = {
   },
 
   disable() {
+    regionalRefresh.stop();
     state.enabled = false;
     invalidateAisSession();
     releaseContinuousRender('ais-vessels');
@@ -405,6 +410,7 @@ const aisLiveVesselsLayer = {
   },
 
   destroy(viewer) {
+    regionalRefresh.stop();
     invalidateAisSession();
     releaseContinuousRender('ais-vessels'); // direct-destroy path (perf wave 2 fix)
     if (state.abort) state.abort.abort();
@@ -764,6 +770,7 @@ function _focusEvidenceVesselSnapshot() {
   });
 }
 
+const regionalRefresh = installRegionalRefresh(aisLiveVesselsLayer, { intervalMs: 60000 });
 export default aisLiveVesselsLayer;
 
 function clearFirstConnectTimer() {
@@ -844,7 +851,7 @@ async function loadLivePositions(viewer) {
   state.abort = requestController;
 
   try {
-    const url = liveApiUrl();
+    const url = liveApiUrl(viewer);
     // Combine the layer's teardown-abort with a hard timeout so a hung upstream
     // can't wedge the poll indefinitely (parity with the track fetch + flights).
     const signal = typeof AbortSignal.any === 'function'
@@ -907,6 +914,22 @@ function applyAisFeedSnapshot(viewer, payload) {
   state.acceptedRowCount = snapshot.acceptedRowCount;
 
   if (snapshot.acceptedRowCount === 0) {
+    // An empty new region must not keep processing the previous region's fleet.
+    // Preserve in-region stale records and selected-target outage grace.
+    if (Array.isArray(payload?.bounds) && payload.bounds.length === 4) {
+      for (const [mmsi, record] of state.vesselMap) {
+        if (record === state.selectedRecord || inFeedRegion(payload.bounds, record.lon, record.lat)) continue;
+        removeRecordPrimitives(record);
+        state.vesselMap.delete(mmsi);
+      }
+      state.unkeyedRecords = state.unkeyedRecords.filter(record => {
+        if (inFeedRegion(payload.bounds, record.lon, record.lat)) return true;
+        removeRecordPrimitives(record); return false;
+      });
+      state.vesselRecords = [...state.vesselMap.values(), ...state.unkeyedRecords];
+      state.lastVisibilityUpdate = 0;
+      updateVisibility(true);
+    }
     state.count = state.vesselRecords.length;
     state.stale = state.count > 0 || Boolean(payload?.refreshing);
     if (isDefinitiveTransportFailure(snapshot.transportStatus)) {
@@ -942,11 +965,12 @@ function applyAisFeedSnapshot(viewer, payload) {
   return { reconciled: true, ...snapshot };
 }
 
-function liveApiUrl() {
+function liveApiUrl(viewer) {
   const base = import.meta.env?.VITE_AIS_LIVE_API_URL || DEFAULT_API_URL;
   const url = new URL(base, window.location.origin);
   url.searchParams.set('maxRows', String(renderRowLimit()));
-  return url.toString();
+  url.searchParams.set('client', regionClientId);
+  return regionalFeedUrl(url.toString(), viewer, { keep: state.selectedRecord?.mmsi || '', target: state.selectedRecord });
 }
 
 function renderRowLimit() {

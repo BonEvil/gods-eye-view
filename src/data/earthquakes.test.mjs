@@ -30,6 +30,34 @@ const FULL_RAW = {
   lon: -150.41,
 };
 
+test('identical earthquake polls retain all entity identities; edits reconcile only affected records', async () => {
+  let source, publications = 0;
+  const viewer = { dataSources: { add(ds) { source = ds; }, remove() {} } };
+  const layer = createEarthquakesLayer({ overlayHost: { setEntries() { publications++; }, setVisible() {}, clearSource() {} } });
+  const features = Array.from({ length: 58 }, (_, i) => ({ id: `event-${i}`, geometry: { coordinates: [i, 20, 10] }, properties: { mag: 3, place: `Place ${i}`, time: 1000 } }));
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ features: structuredClone(features) }) });
+  try {
+    layer.init(viewer); layer.enable(viewer); await layer.update(viewer);
+    const entities = source.entities.values.slice();
+    const geometry = entities.map(e => e.ellipse);
+    await layer.update(viewer);
+    assert.equal(publications, 1);
+    assert.ok(entities.every((e, i) => e === source.entities.values[i] && e.ellipse === geometry[i]));
+    features[0].properties.mag = 6;
+    features[1].properties.place = 'Corrected name';
+    features.pop();
+    await layer.update(viewer);
+    assert.equal(source.entities.values.length, 57);
+    assert.equal(source.entities.values[0], entities[0]);
+    assert.equal(entities[0].ellipse.semiMajorAxis.getValue(), 64000);
+    assert.equal(entities[1].ellipse, geometry[1]);
+    assert.equal(entities[1].properties.place.getValue(), 'Corrected name');
+    layer.disable(viewer); layer.enable(viewer); await layer.update(viewer);
+    assert.equal(publications, 3, 're-enable restores cleared overlays even for an identical payload');
+  } finally { globalThis.fetch = original; layer.destroy(viewer); }
+});
+
 test('earthquake analyst record: full record maps every contract field', () => {
   const r = mapAnalystRecord(FULL_RAW, 3);
   assert.deepEqual(r, {

@@ -1,3 +1,5 @@
+import { parseFeedRegion, inFeedRegion } from './feedRegion.js';
+import { regionalFeedUrl, installRegionalRefresh } from './viewFeedRegion.js';
 /**
  * @module flights
  * @description Real-time flight tracking layer powered by the OpenSky Network API
@@ -332,7 +334,8 @@ function _flightApiUrl(viewer) {
     lat: latitude.toFixed(4),
     lon: longitude.toFixed(4),
   });
-  return `${API_URL}?${params}`;
+  const info = _flightData.get(_trackedIcao);
+  return regionalFeedUrl(`${API_URL}?${params}`, viewer, { keep: _trackedIcao || '', target: info ? { lon: info.rawLon, lat: info.rawLat } : null });
 }
 
 // ---------------------------------------------------------------------------
@@ -3962,6 +3965,7 @@ const flightsLayer = {
    * @param {Cesium.Viewer} viewer
    */
   enable(viewer) {
+    regionalRefresh.start(viewer);
     if (_billboardCollection) _billboardCollection.show = true;
     holdContinuousRender('flights'); // per-frame animator (perf wave 2)
     if (_modelCollection) _modelCollection.show = true;
@@ -4008,6 +4012,7 @@ const flightsLayer = {
    * @param {Cesium.Viewer} viewer
    */
   disable(viewer) {
+    regionalRefresh.stop();
     _abortActiveUpdates();
     _cancelPendingTrackingRestore();
     if (_billboardCollection) _billboardCollection.show = false;
@@ -4131,6 +4136,8 @@ const flightsLayer = {
         return;
       }
 
+      const boundsHeader = response.headers.get('x-feed-bounds');
+      const responseRegion = boundsHeader ? parseFeedRegion(new URLSearchParams({ bbox: boundsHeader })) : null;
       const data = await response.json();
       updateSignal.throwIfAborted();
       if (!data || !Array.isArray(data.states)) {
@@ -4528,7 +4535,9 @@ const flightsLayer = {
       for (const [icao24, bb] of _billboards) {
         if (currentIcaos.has(icao24)) continue;
         const misses = (_missingPolls.get(icao24) || 0) + 1;
-        const limit = _likelyLanded(icao24) ? LANDED_MISSING_POLL_LIMIT : MISSING_POLL_LIMIT;
+        const info = _flightData.get(icao24);
+        const outside = icao24 !== _trackedIcao && responseRegion && !inFeedRegion(responseRegion, info?.rawLon, info?.rawLat);
+        const limit = outside ? 1 : (_likelyLanded(icao24) ? LANDED_MISSING_POLL_LIMIT : MISSING_POLL_LIMIT);
         if (misses < limit) {
           _missingPolls.set(icao24, misses);
           if (icao24 === _trackedIcao && _trackedEntity) {
@@ -4635,6 +4644,7 @@ const flightsLayer = {
    * @param {Cesium.Viewer} viewer
    */
   destroy(viewer) {
+    regionalRefresh.stop();
     _abortActiveUpdates();
     releaseContinuousRender('flights'); // direct-destroy path (perf wave 2 fix)
     _clearTracking();
@@ -5335,4 +5345,5 @@ function _installClickHandler(viewer) {
   document.addEventListener('keydown', _onKeyDown);
 }
 
+const regionalRefresh = installRegionalRefresh(flightsLayer, { intervalMs: 12000 });
 export default flightsLayer;

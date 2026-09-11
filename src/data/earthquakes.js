@@ -127,6 +127,9 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
   let _lastUpdate = null;
   let _lastError = null;
   let _enabled = false;
+  const records = new Map();
+  let overlayDirty = true;
+  let generation = 0;
 
   const layer = {
   id: 'earthquakes',
@@ -136,6 +139,9 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
   updateInterval: 60000,
 
   init(viewer) {
+    generation++;
+    records.clear();
+    overlayDirty = true;
     _dataSource = new Cesium.CustomDataSource('earthquakes');
     _dataSource.show = false;
     viewer.dataSources.add(_dataSource);
@@ -149,6 +155,7 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
 
   enable(viewer) {
     _enabled = true;
+    overlayDirty = true;
     // No continuous-render hold: the discs are static geometry now, so the
     // layer has no per-frame animator to keep the render loop alive for.
     if (_dataSource) _dataSource.show = true;
@@ -163,8 +170,10 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
   },
 
   async update(viewer) {
+    const owner = generation;
     try {
       const response = await fetch(API_URL);
+      if (owner !== generation || !_dataSource) return false;
       if (!response.ok) {
         _lastError = `USGS HTTP ${response.status}`;
         console.warn(`[Data:Earthquakes] API returned ${response.status}`);
@@ -172,17 +181,19 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
       }
 
       const geojson = await response.json();
+      if (owner !== generation || !_dataSource) return false;
       if (!geojson || !Array.isArray(geojson.features)) {
         _lastError = 'Malformed USGS response';
         return false;
       }
 
-      _dataSource.entities.removeAll();
+      const seen = new Set();
       let count = 0;
       const overlayEntries = [];
 
       for (const feature of geojson.features) {
-        const [lon, lat, depthKm] = feature.geometry.coordinates;
+        const [lon, lat, depthKm] = feature?.geometry?.coordinates || [];
+        if (!Number.isFinite(lon) || !Number.isFinite(lat) || Math.abs(lat) > 90 || Math.abs(lon) > 180 || !Number.isFinite(feature?.properties?.mag)) continue;
         const mag = feature.properties.mag;
         const place = feature.properties.place;
         const time = feature.properties.time;
@@ -197,8 +208,17 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
         const outlineAlpha = isSignificant ? 1.0 : 0.8;
 
         const position = Cesium.Cartesian3.fromDegrees(lon, lat);
-        const stableId = feature.id || `event-${count}`;
-        _dataSource.entities.add({
+        const stableId = feature.id || `event-${lon}-${lat}-${time}`;
+        if (seen.has(stableId)) { count--; continue; }
+        seen.add(stableId);
+        const signature = JSON.stringify([lon, lat, depthKm, mag, place, time]);
+        const previous = records.get(stableId);
+        if (previous?.signature === signature) {
+          overlayEntries.push(previous.overlay);
+          continue;
+        }
+        overlayDirty = true;
+        const definition = {
           id: `earthquake:${stableId}`,
           position,
           ellipse: {
@@ -222,16 +242,31 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
             time,
             depth: depthKm,
           },
-        });
-        overlayEntries.push(createEarthquakeOverlayEntry({
+        };
+        let entity = previous?.entity;
+        if (entity) {
+          if (previous.lon !== lon || previous.lat !== lat) entity.position = position;
+          if (previous.mag !== mag || previous.depthKm !== depthKm) entity.ellipse = definition.ellipse;
+          entity.properties = definition.properties;
+        } else entity = _dataSource.entities.add(definition);
+        const overlay = createEarthquakeOverlayEntry({
           id: String(stableId),
           position,
           magnitude: mag,
           accent: color.toCssColorString(),
-        }));
+        });
+        records.set(stableId, { entity, overlay, signature, lon, lat, mag, depthKm });
+        overlayEntries.push(overlay);
       }
 
-      if (_enabled) {
+      for (const [id, record] of records) {
+        if (seen.has(id)) continue;
+        _dataSource.entities.remove(record.entity);
+        records.delete(id);
+        overlayDirty = true;
+      }
+      if (_enabled && overlayDirty) {
+        overlayDirty = false;
         overlayHost.setEntries(
           EARTHQUAKE_OVERLAY_SOURCE_ID,
           selectEarthquakeOverlayCohort(overlayEntries),
@@ -250,6 +285,7 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
       return true;
 
     } catch (e) {
+      if (owner !== generation || !_dataSource) return false;
       console.warn('[Data:Earthquakes] Fetch error:', e);
       _lastError = 'USGS network error';
       return false;
@@ -257,6 +293,8 @@ export function createEarthquakesLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = 
   },
 
   destroy(viewer) {
+    generation++;
+    records.clear();
     _enabled = false;
     overlayHost.clearSource(EARTHQUAKE_OVERLAY_SOURCE_ID);
     overlayHost.setVisible(EARTHQUAKE_OVERLAY_SOURCE_ID, false);

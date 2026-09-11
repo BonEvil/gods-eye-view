@@ -1,3 +1,5 @@
+import { parseFeedRegion, inFeedRegion } from './feedRegion.js';
+import { regionalFeedUrl, installRegionalRefresh } from './viewFeedRegion.js';
 import * as Cesium from 'cesium';
 import { aircraftIncludedInNearby } from './aircraftNearbyPolicy.js';
 import { registerPickOwner, unregisterPickOwner, isOwnedByOtherLayer, resolvePickId } from './pickRegistry.js';
@@ -2667,6 +2669,7 @@ const militaryFlightsLayer = {
    * @param {Cesium.Viewer} viewer - The Cesium viewer instance
    */
   enable(viewer) {
+    regionalRefresh.start(viewer);
     if (_billboardCollection) _billboardCollection.show = true;
     holdContinuousRender('military'); // per-frame animator (perf wave 2)
     if (_modelCollection) _modelCollection.show = true;
@@ -2711,6 +2714,7 @@ const militaryFlightsLayer = {
    * @param {Cesium.Viewer} viewer - The Cesium viewer instance
    */
   disable(viewer) {
+    regionalRefresh.stop();
     _abortActiveUpdates();
     _cancelPendingTrackingRestore();
     if (_billboardCollection) _billboardCollection.show = false;
@@ -2785,7 +2789,7 @@ const militaryFlightsLayer = {
       : resourceController.signal;
     try {
       updateSignal.throwIfAborted();
-      const response = await fetch(API_URL, { signal: updateSignal });
+      const response = await fetch(regionalFeedUrl(API_URL, viewer || _viewer, { keep: _trackedIcao || '', target: _flightData.has(_trackedIcao) ? { lon: _flightData.get(_trackedIcao).rawLon, lat: _flightData.get(_trackedIcao).rawLat } : null }), { signal: updateSignal });
       _lastStatus = response.status;
 
       if (!response.ok) {
@@ -2812,6 +2816,8 @@ const militaryFlightsLayer = {
       }
 
       // adsb.lol returns { ac: [...aircraft], msg: "...", ... }
+      const boundsHeader = response.headers?.get?.('x-feed-bounds');
+      const responseRegion = boundsHeader ? parseFeedRegion(new URLSearchParams({ bbox: boundsHeader })) : null;
       const data = await response.json();
       updateSignal.throwIfAborted();
       if (!data || !Array.isArray(data.ac)) {
@@ -3174,7 +3180,9 @@ const militaryFlightsLayer = {
       for (const [icao24, bb] of _billboards) {
         if (currentIcaos.has(icao24)) continue;
         const misses = (_missingPolls.get(icao24) || 0) + 1;
-        const limit = _likelyLanded(icao24) ? LANDED_MISSING_POLL_LIMIT : MISSING_POLL_LIMIT;
+        const info = _flightData.get(icao24);
+        const outside = icao24 !== _trackedIcao && responseRegion && !inFeedRegion(responseRegion, info?.rawLon, info?.rawLat);
+        const limit = outside ? 1 : (_likelyLanded(icao24) ? LANDED_MISSING_POLL_LIMIT : MISSING_POLL_LIMIT);
         if (misses < limit) {
           _missingPolls.set(icao24, misses);
           if (icao24 === _trackedIcao && _trackedEntity) {
@@ -3244,6 +3252,7 @@ const militaryFlightsLayer = {
    * @param {Cesium.Viewer} viewer - The Cesium viewer instance
    */
   destroy(viewer) {
+    regionalRefresh.stop();
     _abortActiveUpdates();
     releaseContinuousRender('military'); // direct-destroy path (perf wave 2 fix)
     _clearTracking();
@@ -3873,4 +3882,5 @@ function _installClickHandler(viewer) {
   document.addEventListener('keydown', _onKeyDown);
 }
 
+const regionalRefresh = installRegionalRefresh(militaryFlightsLayer, { intervalMs: 12000 });
 export default militaryFlightsLayer;

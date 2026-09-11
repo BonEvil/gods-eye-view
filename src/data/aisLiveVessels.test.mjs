@@ -36,6 +36,18 @@ import { registerPickOwner, unregisterPickOwner } from './pickRegistry.js';
 import { applyVesselOverlayPolicy } from './vesselLabels.js';
 import { layerFeedState } from './manager.js';
 
+test('empty regional response drops distant vessel work while preserving selection and local stale records', () => {
+  const local = makeRecord({ mmsi: 'local', lon: 10, lat: 10 });
+  const selected = makeRecord({ mmsi: 'selected', lon: 50, lat: 50 });
+  const distant = makeRecord({ mmsi: 'distant', lon: 90, lat: 50 });
+  _setVesselStateForTest({ records: [local, selected, distant], selectedRecord: selected });
+  try {
+    _applyAisFeedSnapshotForTest(null, { bounds: [9, 9, 11, 11], rows: [], status: 'live', lastMessageAt: 123 });
+    assert.equal(_getVesselStateForTest().vesselCount, 2);
+    assert.equal(aisLiveVesselsLayer.getStats().stale, true);
+  } finally { _setVesselStateForTest({}); }
+});
+
 test('open feed with vessels is healthy (null)', () => {
   assert.equal(deriveAisFeedError({ status: 'open', lastMessageAt: 1, error: null }, 42), null);
 });
