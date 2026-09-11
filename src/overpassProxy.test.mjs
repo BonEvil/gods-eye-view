@@ -214,7 +214,7 @@ test('coalesced outage callers both receive last-good data, never a cached refus
         assert.equal(response.body, DATA.body);
         assert.equal(response.headers['X-Overpass-Cache'], 'STALE');
       }
-      assert.equal(fetches, 4, 'one shared, bounded mirror sequence');
+      assert.equal(fetches, 3, 'one shared, bounded mirror sequence');
       assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), stale);
     } finally {
       release.resolve();

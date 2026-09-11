@@ -183,13 +183,12 @@ const OPENSKY_SOURCE_STALE_MS = 120_000;
 // ---------------------------------------------------------------------------
 /** Ordered list of Overpass API mirrors; tried sequentially on failure/rate-limit. */
 const OVERPASS_UPSTREAMS = [
+  // Independent global instance; current ALPR data verified September 2026.
+  // Public usage policy: https://wiki.openstreetmap.org/wiki/Overpass_API
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://lz4.overpass-api.de/api/interpreter',
-  // Community full-planet instance (privateforge nonprofit) — added 2026-07-30
-  // when all three mirrors above refused this IP (likely a dev-traffic rate
-  // ban; refused connections fail in ms, so healthy mirrors above still win).
-  // Verified: planet coverage (Texas query), CORS *, ~5-20 s cold latency.
+  // kumi.systems resolves to this host; lz4 aliases the main instance.
+  // Avoid repeating the same outage through multiple hostnames.
   'https://overpass.private.coffee/api/interpreter',
 ];
 /**
@@ -3113,6 +3112,9 @@ export function openSkyProxy() {
           // synthesize the 429 locally — hammering upstream mid-cooldown can't
           // succeed and just burns goodwill.
           if (inCooldown) {
+            if (await serveAdsbLolPointFallback(
+              req, res, requestedMode, 'opensky_cooldown_regional_fallback',
+            )) return;
 
             res.writeHead(429, buildOpenSkyHeaders({
               cacheStatus: 'COOLDOWN',
@@ -3183,6 +3185,15 @@ export function openSkyProxy() {
           }
 
           let body = await upstream.text();
+          if (upstream.ok) {
+            // Credit governor: adapt the cache TTL to the remaining daily
+            // budget so a continuously-open app stretches its polls instead of
+            // exhausting the quota mid-day. Success also clears any cooldown.
+            const remaining = Number(upstream.headers.get('x-rate-limit-remaining') ?? NaN);
+            _openskyTtlMs = openskyAdaptiveTtlMs(remaining);
+            nextRequestAt = now + _openskyTtlMs;
+            _openskyCooldownUntil = 0;
+          }
           const sourceEpochMs = upstream.ok ? openSkySourceEpochMs(body) : null;
           if (
             upstream.ok
@@ -3292,13 +3303,7 @@ export function openSkyProxy() {
               usedMode,
               reason,
             };
-            // Credit governor: adapt the cache TTL to the remaining daily
-            // budget so a continuously-open app stretches its polls instead of
-            // exhausting the quota mid-day. Success also clears any cooldown.
-            const remaining = Number(upstream.headers.get('x-rate-limit-remaining'));
-            _openskyTtlMs = openskyAdaptiveTtlMs(remaining);
-            nextRequestAt = now + _openskyTtlMs;
-            _openskyCooldownUntil = 0;
+
           }
 
           res.writeHead(

@@ -51,3 +51,33 @@ test('dateline serialization keeps both sides and excludes Greenwich', async () 
   }, '/?bbox=170,-10,-170,10');
   assert.equal(result.body.ac.length, 2);
 });
+
+test('uncached regions use labeled regional flights during quota pacing without another OpenSky request', async () => {
+  const original = fetch, auth = process.env.OPENSKY_AUTH_MODE;
+  process.env.OPENSKY_AUTH_MODE = 'anon';
+  const urls = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    if (String(url).includes('api.adsb.lol')) return Response.json({now: Date.now(), ac: [
+      {hex: 'abc123', lat: 20, lon: 20, alt_baro: 10000, gs: 200, track: 90, seen_pos: 0},
+      {hex: 'abc124', lat: 40, lon: 40, alt_baro: 10000, seen_pos: 0},
+    ]});
+    return Response.json({time: Date.now()/1000, states: []}, {headers: {'x-rate-limit-remaining': '100'}});
+  };
+  try {
+    const handler = middleware(openSkyProxy());
+    await call(handler, '/?lat=10&lon=10&bbox=9,9,11,11');
+    const result = await call(handler, '/?lat=20&lon=20&bbox=19,19,21,21');
+    assert.equal(result.status, 200);
+    assert.equal(result.headers['X-Flight-Source'], 'adsb.lol');
+    assert.equal(result.headers['X-OpenSky-Auth-Reason'], 'opensky_cooldown_regional_fallback');
+    assert.equal(result.body.states.length, 1);
+    assert.equal(result.body.states[0][0], 'abc123');
+    assert.equal(urls.filter(url => url.includes('opensky-network')).length, 1);
+    assert.equal(urls.length, 2);
+    globalThis.fetch = async () => { throw Error('regional provider offline'); };
+    const failed = await call(handler, '/?lat=25&lon=25&bbox=24,24,26,26');
+    assert.equal(failed.status, 429);
+    assert.ok(Number(failed.headers['X-OpenSky-Retry-After-Seconds']) > 0);
+  } finally { globalThis.fetch = original; if (auth === undefined) delete process.env.OPENSKY_AUTH_MODE; else process.env.OPENSKY_AUTH_MODE = auth; }
+});
