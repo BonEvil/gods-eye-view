@@ -1,3 +1,4 @@
+import alprCamerasLayer from './data/alprCameras.js';
 import * as Cesium from 'cesium';
 import { StyleManager } from './ui.js';
 import { flyToAustin } from './camera.js';
@@ -219,6 +220,7 @@ async function init() {
     dataManager.register(bikeshareLayer);
     dataManager.register(aisLiveVesselsLayer);
     dataManager.register(militaryInstallationsLayer);
+    dataManager.register(alprCamerasLayer);
     dataManager.register(militaryAwarenessLayer);
     militaryAwarenessLayer.attachDataManager(dataManager);
     for (const layer of localDataLayers) {

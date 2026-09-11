@@ -9551,3 +9551,14 @@ body.scene-playback-mode #key-setup {
 .aircraft-details button:disabled { opacity: .5; cursor: default; }
 
 .cockpit-mode .aircraft-details { display: none; }
+
+
+.alpr-details { position:fixed; z-index:120; right:24px; bottom:100px; width:min(360px,calc(100vw - 48px)); max-height:65vh; overflow:auto; box-sizing:border-box; padding:18px; color:#fae7f5; background:rgba(25,12,25,.97); border:1px solid #b86696; border-radius:10px; font:13px/1.5 system-ui,sans-serif; }
+.alpr-details h2 { margin:0; font-size:18px; }
+.alpr-details p { color:#d5b8cb; }
+.alpr-details dl { display:grid; grid-template-columns:auto 1fr; gap:6px 12px; }
+.alpr-details dd { margin:0; text-align:right; overflow-wrap:anywhere; }
+.alpr-details a { color:#ffbce3; text-decoration:underline; }
+.alpr-details button { min-height:44px; width:100%; color:#fae7f5; background:#422038; border:1px solid #b86696; border-radius:5px; cursor:pointer; font:inherit; }
+.alpr-details :focus-visible { outline:2px solid #ffbce3; outline-offset:3px; }
+.cockpit-mode .alpr-details { display:none; }
