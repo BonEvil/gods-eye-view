@@ -114,7 +114,7 @@ test('civilian and military click handlers apply duration only at the deselect b
     readFileSync(new URL('./militaryFlights.js', import.meta.url), 'utf8'),
   ];
   for (const source of sources) {
-    assert.match(source, /isTrackingSelectionGesture\(gesture\)[\s\S]+scene\.pick/);
+    assert.match(source, /isTrackingSelectionGesture\(gesture\)[\s\S]+pickAircraft/);
     assert.match(source, /isTrackingClickGesture\(gesture\)[\s\S]+_clearTracking\([^)]*\{ origin: 'user' \}\)/);
   }
   assert.doesNotMatch(

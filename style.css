@@ -9520,3 +9520,34 @@ body.scene-playback-mode #key-setup {
   border-color: rgba(255, 170, 150, 0.65);
   outline: none;
 }
+
+/* Aircraft inspection stays separate from camera following. */
+.aircraft-details {
+  position: fixed;
+  z-index: 120;
+  left: 50%;
+  bottom: 110px;
+  transform: translateX(-50%);
+  width: min(340px, calc(100vw - 32px));
+  max-height: 55vh;
+  overflow: auto;
+  padding: 18px;
+  box-sizing: border-box;
+  color: #e2f7fa;
+  background: rgba(7, 17, 25, .96);
+  border: 1px solid #438a96;
+  border-radius: 10px;
+  box-shadow: 0 8px 32px #0008;
+  font: 13px/1.5 system-ui, sans-serif;
+}
+.aircraft-details h2 { margin: 0; font-size: 18px; }
+.aircraft-details p { margin: 4px 0 12px; color: #9bbbc2; }
+.aircraft-details dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; margin: 0; }
+.aircraft-details dt { color: #9bbbc2; }
+.aircraft-details dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+.aircraft-details-actions { display: flex; gap: 10px; margin-top: 16px; }
+.aircraft-details button { min-height: 44px; flex: 1; padding: 8px 12px; color: #e2f7fa; background: #153742; border: 1px solid #438a96; border-radius: 5px; cursor: pointer; font: inherit; }
+.aircraft-details button:focus-visible { outline: 2px solid #9df0ff; outline-offset: 3px; }
+.aircraft-details button:disabled { opacity: .5; cursor: default; }
+
+.cockpit-mode .aircraft-details { display: none; }
