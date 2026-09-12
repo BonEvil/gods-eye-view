@@ -46,6 +46,8 @@ import {
 } from './src/data/tomtomTiles.js';
 import { filterTrailing24h, parseFirmsCsv } from './src/data/firmsCsv.js';
 import { googleApiReferrer } from './src/data/googleReferrer.js';
+import { gdotCameraFromRecord } from './src/data/gdotCameras.js';
+import { allocateSourceBudget, describeSourceMix } from './src/data/cctvSourceBudget.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { defineConfig, loadEnv } from 'vite';
@@ -183,13 +185,12 @@ const OPENSKY_SOURCE_STALE_MS = 120_000;
 // ---------------------------------------------------------------------------
 /** Ordered list of Overpass API mirrors; tried sequentially on failure/rate-limit. */
 const OVERPASS_UPSTREAMS = [
+  // Independent global instance; current ALPR data verified September 2026.
+  // Public usage policy: https://wiki.openstreetmap.org/wiki/Overpass_API
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://lz4.overpass-api.de/api/interpreter',
-  // Community full-planet instance (privateforge nonprofit) — added 2026-07-30
-  // when all three mirrors above refused this IP (likely a dev-traffic rate
-  // ban; refused connections fail in ms, so healthy mirrors above still win).
-  // Verified: planet coverage (Texas query), CORS *, ~5-20 s cold latency.
+  // kumi.systems resolves to this host; lz4 aliases the main instance.
+  // Avoid repeating the same outage through multiple hostnames.
   'https://overpass.private.coffee/api/interpreter',
 ];
 /**
@@ -3113,6 +3114,9 @@ export function openSkyProxy() {
           // synthesize the 429 locally — hammering upstream mid-cooldown can't
           // succeed and just burns goodwill.
           if (inCooldown) {
+            if (await serveAdsbLolPointFallback(
+              req, res, requestedMode, 'opensky_cooldown_regional_fallback',
+            )) return;
 
             res.writeHead(429, buildOpenSkyHeaders({
               cacheStatus: 'COOLDOWN',
@@ -3183,6 +3187,15 @@ export function openSkyProxy() {
           }
 
           let body = await upstream.text();
+          if (upstream.ok) {
+            // Credit governor: adapt the cache TTL to the remaining daily
+            // budget so a continuously-open app stretches its polls instead of
+            // exhausting the quota mid-day. Success also clears any cooldown.
+            const remaining = Number(upstream.headers.get('x-rate-limit-remaining') ?? NaN);
+            _openskyTtlMs = openskyAdaptiveTtlMs(remaining);
+            nextRequestAt = now + _openskyTtlMs;
+            _openskyCooldownUntil = 0;
+          }
           const sourceEpochMs = upstream.ok ? openSkySourceEpochMs(body) : null;
           if (
             upstream.ok
@@ -3292,13 +3305,7 @@ export function openSkyProxy() {
               usedMode,
               reason,
             };
-            // Credit governor: adapt the cache TTL to the remaining daily
-            // budget so a continuously-open app stretches its polls instead of
-            // exhausting the quota mid-day. Success also clears any cooldown.
-            const remaining = Number(upstream.headers.get('x-rate-limit-remaining'));
-            _openskyTtlMs = openskyAdaptiveTtlMs(remaining);
-            nextRequestAt = now + _openskyTtlMs;
-            _openskyCooldownUntil = 0;
+
           }
 
           res.writeHead(
@@ -3594,6 +3601,21 @@ const CALTRANS_ANCHORS = [
   { lat: 38.5816, lon: -121.4944 }, // Sacramento
 ];
 /** TfL JamCams: one keyless list endpoint; frames live on a public S3 bucket. */
+/** Georgia DOT 511: DataTables-style list endpoint, no key required.
+ * Only the still-image endpoint is public; the per-record HLS `videoUrl` is
+ * flagged `isVideoAuthRequired` and answers 401 (verified 2026-09-10). */
+const GDOT_CCTV_URL = 'https://511ga.org/List/GetData/Cameras';
+const GDOT_ORIGIN = 'https://511ga.org';
+/** The endpoint caps a page at 100 rows regardless of the requested length, so
+ * coverage is (pages x 100). Statewide is ~4,330 rows = 44 requests per refresh;
+ * the default search narrows that to metro Atlanta in 4. */
+const GDOT_PAGE_SIZE = 100;
+const DEFAULT_GDOT_MAX_PAGES = 4;
+/** Server-side filter applied before paging. Empty string fetches statewide. */
+const DEFAULT_GDOT_SEARCH = 'Atlanta';
+const DEFAULT_GDOT_MAX_SOURCES = 250;
+/** Prioritization anchor: Five Points, downtown Atlanta. */
+const ATLANTA_DOWNTOWN = { lat: 33.7557, lon: -84.3885 };
 const TFL_JAMCAM_URL = 'https://api.tfl.gov.uk/Place/Type/JamCam';
 const TFL_IMAGE_ORIGIN = 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/';
 const DEFAULT_TFL_MAX_SOURCES = 250;
@@ -4288,6 +4310,83 @@ async function getCctvSources() {
  *
  * @returns {Promise<Array<object>>} Deduplicated, capped source list.
  */
+/**
+ * Fetch Georgia DOT 511 cameras (metro Atlanta by default).
+ *
+ * The upstream is a DataTables endpoint: POST, form-encoded, and it silently
+ * caps a page at 100 rows no matter what `length` asks for — so coverage is
+ * bounded by page count, not by a single big request. Its server-side search
+ * runs before paging, which is what keeps the default (metro Atlanta, ~316
+ * matches) to 4 requests instead of the 44 a statewide crawl would need.
+ *
+ * Pages are fetched sequentially and a failed page ends the walk rather than
+ * aborting the pack: a partial catalog of real cameras beats none, and the
+ * 15-minute source cache means a transient upstream blip self-heals.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadGdotSourcesFromOpenData() {
+  const maxPagesRaw = Number(process.env.CCTV_GDOT_MAX_PAGES || DEFAULT_GDOT_MAX_PAGES);
+  const maxPages = Number.isFinite(maxPagesRaw) ? Math.max(1, Math.min(50, Math.floor(maxPagesRaw))) : DEFAULT_GDOT_MAX_PAGES;
+  const search = process.env.CCTV_GDOT_SEARCH ?? DEFAULT_GDOT_SEARCH;
+
+  const cameras = [];
+  const seen = new Set();
+  let total = null;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const body = new URLSearchParams({
+      draw: String(page + 1),
+      start: String(page * GDOT_PAGE_SIZE),
+      length: String(GDOT_PAGE_SIZE),
+      'search[value]': String(search),
+      'search[regex]': 'false',
+    });
+
+    let rows = [];
+    try {
+      const resp = await fetch(GDOT_CCTV_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          Accept: 'application/json',
+        },
+        body,
+        signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const payload = await resp.json();
+      rows = Array.isArray(payload?.data) ? payload.data : [];
+      if (total === null) total = Number(payload?.recordsFiltered ?? payload?.recordsTotal ?? NaN);
+    } catch (err) {
+      console.warn(`[CCTV] GDOT page ${page} fetch failed:`, err?.message || err);
+      break;
+    }
+
+    for (const row of rows) {
+      const camera = gdotCameraFromRecord(row, {
+        origin: GDOT_ORIGIN,
+        headingFrom: directionToHeading,
+        fallbackHeading: fallbackHeadingFromId,
+      });
+      if (!camera || seen.has(camera.id)) continue;
+      seen.add(camera.id);
+      cameras.push(camera);
+    }
+
+    // Short page means the result set is exhausted; no point asking for more.
+    if (rows.length < GDOT_PAGE_SIZE) break;
+  }
+
+  const maxRaw = Number(process.env.CCTV_GDOT_MAX_SOURCES || DEFAULT_GDOT_MAX_SOURCES);
+  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(600, Math.floor(maxRaw))) : DEFAULT_GDOT_MAX_SOURCES;
+  const prioritized = prioritizeSources(cameras, maxCount, [ATLANTA_DOWNTOWN]);
+  const totalNote = Number.isFinite(total) ? ` of ${total} matching upstream` : '';
+  console.log(`[CCTV] Loaded Georgia DOT camera sources: ${cameras.length}${totalNote} (using nearest ${prioritized.length})`);
+  return prioritized;
+}
+
 async function refreshCctvSources() {
   const fromFile = loadSourcesFromFile();
   const fromEnv = loadSourcesFromEnv();
@@ -4299,22 +4398,26 @@ async function refreshCctvSources() {
   // Austin-only fetch, now governing all three. Each pack fails independently.
   const needsLiveSources = forceAustin || ((fromFile.length + fromEnv.length) === 0 && preferAustin);
   const tflEnabled = String(process.env.CCTV_TFL_ENABLED || '1').trim() !== '0';
+  const gdotEnabled = String(process.env.CCTV_GDOT_ENABLED || '1').trim() !== '0';
 
   let fromAustin = [];
   let fromCaltrans = [];
   let fromTfl = [];
+  let fromGdot = [];
   if (needsLiveSources) {
-    const [austinResult, caltransResult, tflResult] = await Promise.allSettled([
+    const [austinResult, caltransResult, tflResult, gdotResult] = await Promise.allSettled([
       loadAustinSourcesFromOpenData(),
       loadCaltransSourcesFromOpenData(),
       tflEnabled ? loadTflSourcesFromOpenData() : Promise.resolve([]),
+      gdotEnabled ? loadGdotSourcesFromOpenData() : Promise.resolve([]),
     ]);
     fromAustin = austinResult.status === 'fulfilled' ? austinResult.value : [];
     fromCaltrans = caltransResult.status === 'fulfilled' ? caltransResult.value : [];
     fromTfl = tflResult.status === 'fulfilled' ? tflResult.value : [];
+    fromGdot = gdotResult.status === 'fulfilled' ? gdotResult.value : [];
   }
   // Live sources first so file/env overrides win on duplicate IDs (Map last-write).
-  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromFile, ...fromEnv];
+  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromGdot, ...fromFile, ...fromEnv];
 
   // Deduplicate by camera ID (last-write wins because of Map.set)
   const byId = new Map();
@@ -4328,10 +4431,14 @@ async function refreshCctvSources() {
   const mergedSources = Array.from(byId.values());
   const maxRaw = Number(process.env.CCTV_MAX_SOURCES || DEFAULT_CCTV_MAX_SOURCES);
   const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(1200, Math.floor(maxRaw))) : DEFAULT_CCTV_MAX_SOURCES;
+  // Share the cut across packs instead of slicing positionally: the packs merge
+  // in a fixed order, so a plain slice made the LAST pack absorb the entire
+  // shortfall (adding GDOT put the merged total at 1050 against a 900 cap and
+  // silently cost Atlanta 150 of its 250 cameras).
+  const capped = allocateSourceBudget(mergedSources, maxCount);
   if (mergedSources.length > maxCount) {
-    console.warn(`[CCTV] source catalog ${mergedSources.length} exceeds cap ${maxCount}; keeping the first ${maxCount} (raise CCTV_MAX_SOURCES or lower a per-pack cap to change which).`);
+    console.warn(`[CCTV] source catalog ${mergedSources.length} exceeds cap ${maxCount}; kept ${capped.length} shared across packs (${describeSourceMix(capped)}). Raise CCTV_MAX_SOURCES or lower a per-pack cap to change the mix.`);
   }
-  const capped = mergedSources.length > maxCount ? mergedSources.slice(0, maxCount) : mergedSources;
   if (capped.length > 0 || _cctvSourceCache.length === 0) {
     _cctvSourceCache = capped;
   } else {

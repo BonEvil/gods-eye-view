@@ -26,6 +26,7 @@ import * as Cesium from 'cesium';
  * @type {{ key: string, html: string }[]}
  */
 export const DATA_CREDITS = [
+  { key: 'alpr', html: 'ALPR camera mapping: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors (ODbL 1.0)</a> · <a href="https://deflock.org" target="_blank" rel="noopener">DeFlock mapping community</a>' },
   // ── Live sources ────────────────────────────────────────────────
   {
     key: 'opensky',
