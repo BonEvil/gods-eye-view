@@ -99,7 +99,8 @@ export function showAircraftDetails(viewer, { id, layerId, read, track, stop, is
     trackButton.disabled = !current;
     if (!current) return;
     fields.replaceChildren();
-    for (const [key, label] of [['callsign','Callsign'], ['registration','Registration'], ['operator','Operator'], ['type','Aircraft'], ['altitude','Altitude'], ['speed','Speed'], ['heading','Heading'], ['route','Route'], ['icao24','ICAO']]) {
+    for (const [key, label] of [['callsign','Callsign'], ['registration','Registration'], ['operator','Operator'], ['type','Aircraft'], ['altitude','Altitude'], ['speed','Speed'], ['heading','Heading'], ['origin','Origin'], ['destination','Destination'], ['route','Route'], ['icao24','ICAO']]) {
+      if (key === 'route' && (current.properties?.origin || current.properties?.destination)) continue;
       const value = current.properties?.[key];
       if (!value) continue;
       const term = document.createElement('dt'); term.textContent = label;
