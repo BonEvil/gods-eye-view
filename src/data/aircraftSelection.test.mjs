@@ -85,7 +85,10 @@ test('inspection shows details without following; Track follows and Close exits 
     assert.equal(calls.length, 0);
     panel.children[3].children[0].listeners.click();
     assert.equal(tracks, 1);
-    assert.equal(panel.children[3].children[0].textContent, 'Stop tracking');
+    assert.equal(panel.removed, true, 'Track dismisses the details panel');
+    assert.equal(tracking, true, 'dismissing details keeps tracking active');
+    assert.equal(stops, 0);
+    assert.equal(window.__gevContextStore.selectedEntityId, 'a', 'the tracked context remains selected');
     // Inspect another layer while A is still followed; Close must release A.
     showAircraftDetails(viewer, {...options, id:'b', layerId:'military', stop() { throw new Error('wrong tracker'); }, isTracking: () => false});
     assert.equal(panel.removed, true);
