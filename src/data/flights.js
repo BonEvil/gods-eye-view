@@ -441,6 +441,8 @@ function _contextSubjectMetadata(icao24) {
         : '',
       heading: Number.isFinite(described.track) ? `${Math.round(described.track)}°` : '',
       route: route || '',
+      origin: route ? [described.route.origin.code, described.route.origin.name].filter(Boolean).join(' · ') : '',
+      destination: route ? [described.route.destination.code, described.route.destination.name].filter(Boolean).join(' · ') : '',
       icao24,
       // Honesty cue: the contact is coasting on dead reckoning, so the
       // narrated position/velocity are last-known rather than live.
@@ -853,7 +855,7 @@ function _requestRouteEnrichment(icao24) {
     meta.airline = data.airline || meta.airline;
     if (data.origin && data.destination) meta.route = { origin: data.origin, destination: data.destination };
     if (icao24 === _trackedIcao && _trackedEntity) _updateTrackedLabelModel(icao24);
-  }, true); // route lookups only fire for the TRACKED plane — front of the queue
+  }, true); // route lookups only fire for inspected or tracked planes — front of the queue
 }
 
 // ---------------------------------------------------------------------------
@@ -5253,7 +5255,10 @@ function _onKeyDown(e) {
   }
 }
 
-function _inspectFlight(id) {
+export function _inspectFlight(id) {
+  // Inspection must resolve the route without requiring a camera-follow action.
+  // The shared enrichment queue deduplicates repeat clicks and bounds requests.
+  _requestRouteEnrichment(id);
   showAircraftDetails(_viewer, {
     id, layerId: 'flights', read: _contextSubjectMetadata,
     track: (target) => flightsLayer.trackById(target, { origin: 'user' }),
